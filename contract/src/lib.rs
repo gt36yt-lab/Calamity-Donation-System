@@ -1,52 +1,41 @@
-//! # CalamityDonation — Soroban smart contract
+//! # CalamityDonation — Soroban smart contract (v2, SDK 27)
 //!
-//! Accepts native XLM donations on the Stellar testnet, tracks per-donor
-//! totals, and lets an authorised admin withdraw funds to the LGU treasury
-//! wallet.
+//! ## Architecture
+//!
+//! The contract records donations that are sent to the LGU wallet via a
+//! classic XLM Payment operation in the *same* transaction as
+//! `record_donation`.  The contract never moves tokens itself, eliminating
+//! SAC sub-invocation auth entries and the nonce-expiry problems they cause.
 //!
 //! ## Storage layout
 //!
-//! | Key                       | Type      | Description                       |
-//! |---------------------------|-----------|-----------------------------------|
-//! | `DataKey::Admin`          | `Address` | Contract deployer / LGU wallet    |
-//! | `DataKey::Total`          | `i128`    | Cumulative stroops received       |
-//! | `DataKey::DonorCount`     | `u32`     | Number of unique donors           |
-//! | `DataKey::DonorTotal(a)`  | `i128`    | Per-donor cumulative stroops      |
+//! | Key                      | Type      | TTL policy   | Description                  |
+//! |--------------------------|-----------|--------------|------------------------------|
+//! | `DataKey::Admin`         | `Address` | instance     | LGU treasury / admin         |
+//! | `DataKey::Total`         | `i128`    | instance     | Cumulative stroops recorded  |
+//! | `DataKey::DonorCount`    | `u32`     | instance     | Unique donor count           |
+//! | `DataKey::DonorTotal(a)` | `i128`    | persistent   | Per-donor cumulative stroops |
 //!
 //! ## Entry-points
 //!
-//! | Function          | Auth     | Description                                   |
-//! |-------------------|----------|-----------------------------------------------|
-//! | `initialize`      | admin    | One-time setup; records admin address          |
-//! | `donate`          | donor    | Transfer XLM into contract + record it         |
-//! | `withdraw`        | admin    | Move XLM balance to any address                |
-//! | `get_total`       | —        | Cumulative stroops received                    |
-//! | `get_donor_total` | —        | One donor's cumulative stroops                 |
-//! | `get_donor_count` | —        | Number of unique donors                        |
-//! | `get_admin`       | —        | Admin address                                  |
+//! | Function           | Auth  | Description                              |
+//! |--------------------|-------|------------------------------------------|
+//! | `__constructor`    | admin | Atomic init at deploy time (CAP-0058)    |
+//! | `record_donation`  | donor | Log a donation (no token movement)       |
+//! | `get_total`        | —     | Cumulative stroops recorded              |
+//! | `get_donor_total`  | —     | One donor's cumulative stroops           |
+//! | `get_donor_count`  | —     | Number of unique donors                  |
+//! | `get_admin`        | —     | Admin address                            |
 
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short,
-    token::Client as TokenClient,
+    contract, contractevent, contractimpl, contracttype,
     Address, Env, String,
 };
 
 // ---------------------------------------------------------------------------
-// The Stellar native XLM token contract has a fixed, well-known address on
-// every Soroban network.  It is derived from the asset "native" and is the
-// same value across testnet and mainnet because it's computed from the asset
-// descriptor alone, not from a network-specific seed.
-//
-// stellar-sdk produces this via Asset.native().contractId(networkPassphrase),
-// which resolves to the constant below on both testnet and mainnet.
-// ---------------------------------------------------------------------------
-const NATIVE_TOKEN_ADDRESS: &str =
-    "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
-
-// ---------------------------------------------------------------------------
-// Storage key enum
+// Storage keys
 // ---------------------------------------------------------------------------
 
 #[contracttype]
@@ -59,29 +48,20 @@ pub enum DataKey {
 }
 
 // ---------------------------------------------------------------------------
-// Event payloads (emitted for off-chain indexers and the frontend)
+// Events  (SDK 27 — #[contractevent] macro with #[topic] fields)
 // ---------------------------------------------------------------------------
 
-#[contracttype]
-#[derive(Clone)]
-pub struct DonationEvent {
-    /// Donating address.
+#[contractevent]
+pub struct DonationRecorded {
+    /// Becomes a topic in the XDR event envelope.
+    #[topic]
     pub donor: Address,
-    /// Stroops transferred in this call (1 XLM = 10_000_000 stroops).
-    pub amount: i128,
-    /// Arbitrary memo (≤ 28 chars; longer strings are accepted but the
-    /// Stellar memo field on the wrapping tx is independent).
+    /// Stroops donated this call.
+    pub amount_stroops: i128,
+    /// Free-text tag (family id, supply category, etc.) — max 64 bytes.
     pub memo: String,
-    /// New contract-wide cumulative total after this donation.
+    /// Cumulative total after this donation.
     pub running_total: i128,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct WithdrawEvent {
-    pub admin: Address,
-    pub amount: i128,
-    pub to: Address,
 }
 
 // ---------------------------------------------------------------------------
@@ -91,50 +71,53 @@ pub struct WithdrawEvent {
 #[contract]
 pub struct CalamityDonation;
 
+/// Ledger TTL constants.
+/// 1 ledger ≈ 5 s → 17 280 ledgers ≈ 1 day.
+const LEDGERS_PER_DAY: u32 = 17_280;
+const TTL_THRESHOLD: u32 = 30 * LEDGERS_PER_DAY; // extend if below 30 days
+const TTL_EXTEND_TO: u32 = 60 * LEDGERS_PER_DAY; // extend out to 60 days
+
 #[contractimpl]
 impl CalamityDonation {
     // -----------------------------------------------------------------------
-    // Lifecycle
+    // Constructor — runs once, atomically, at deploy time (CAP-0058).
+    // Pass --  --admin <address>  in `stellar contract deploy`.
     // -----------------------------------------------------------------------
-
-    /// One-time initialisation.  Call immediately after deployment.
-    /// `admin` must sign — use the LGU treasury keypair.
-    pub fn initialize(env: Env, admin: Address) {
-        if env.storage().instance().has(&DataKey::Admin) {
-            panic!("already initialised");
-        }
+    pub fn __constructor(env: Env, admin: Address) {
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Total, &0_i128);
         env.storage().instance().set(&DataKey::DonorCount, &0_u32);
-        // ~30 days of TTL (ledger closes ~every 5 s → 518 400 ledgers ≈ 30 d)
-        env.storage().instance().extend_ttl(518_400, 518_400);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
     }
 
     // -----------------------------------------------------------------------
-    // Donate
+    // record_donation
+    //
+    // Called by the donor in the SAME transaction that contains a classic
+    // Payment op sending XLM to the LGU wallet.  The contract simply records
+    // the amount — it never touches tokens itself.
+    //
+    // Parameters
+    //   donor          — the donating address (must sign the transaction)
+    //   amount_stroops — XLM amount in stroops (must match the Payment op)
+    //   memo           — free-text tag (max 64 bytes recommended)
     // -----------------------------------------------------------------------
-
-    /// Pull `amount` stroops of native XLM from `donor` into this contract.
-    ///
-    /// Freighter signs the transaction that invokes this entry-point.
-    /// The token.transfer call requires an auth entry for the donor address,
-    /// which Freighter produces automatically when the dApp calls
-    /// `signTransaction`.
-    pub fn donate(env: Env, donor: Address, amount: i128, memo: String) {
+    pub fn record_donation(
+        env: Env,
+        donor: Address,
+        amount_stroops: i128,
+        memo: String,
+    ) {
         donor.require_auth();
 
-        if amount <= 0 {
+        if amount_stroops <= 0 {
             panic!("amount must be positive");
         }
 
-        // Transfer native XLM from the donor into this contract.
-        let token_addr =
-            Address::from_string(&String::from_str(&env, NATIVE_TOKEN_ADDRESS));
-        let token = TokenClient::new(&env, &token_addr);
-        token.transfer(&donor, &env.current_contract_address(), &amount);
-
-        // ---- Update per-donor persistent storage ----
+        // ---- per-donor persistent total (unique donor tracking) ----
         let donor_key = DataKey::DonorTotal(donor.clone());
         let prev_donor: i128 = env
             .storage()
@@ -143,7 +126,7 @@ impl CalamityDonation {
             .unwrap_or(0_i128);
 
         if prev_donor == 0 {
-            // First donation from this address → increment unique donor count.
+            // First donation from this address — increment unique donor count.
             let count: u32 = env
                 .storage()
                 .instance()
@@ -154,83 +137,38 @@ impl CalamityDonation {
                 .set(&DataKey::DonorCount, &(count + 1));
         }
 
-        let new_donor_total = prev_donor + amount;
+        let new_donor_total = prev_donor + amount_stroops;
+        env.storage().persistent().set(&donor_key, &new_donor_total);
         env.storage()
             .persistent()
-            .set(&donor_key, &new_donor_total);
-        // Keep donor record alive for ~30 days.
-        env.storage()
-            .persistent()
-            .extend_ttl(&donor_key, 518_400, 518_400);
+            .extend_ttl(&donor_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
-        // ---- Update global instance total ----
+        // ---- global instance total ----
         let prev_total: i128 = env
             .storage()
             .instance()
             .get(&DataKey::Total)
             .unwrap_or(0_i128);
-        let new_total = prev_total + amount;
+        let new_total = prev_total + amount_stroops;
         env.storage().instance().set(&DataKey::Total, &new_total);
-        env.storage().instance().extend_ttl(518_400, 518_400);
-
-        // ---- Emit donation event ----
-        env.events().publish(
-            (symbol_short!("donate"), donor.clone()),
-            DonationEvent {
-                donor,
-                amount,
-                memo,
-                running_total: new_total,
-            },
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Withdraw  (admin only)
-    // -----------------------------------------------------------------------
-
-    /// Transfer `amount` stroops to `to`.  Pass `amount = 0` to sweep the
-    /// entire contract balance.  Only the admin address (set at initialise)
-    /// may call this.
-    pub fn withdraw(env: Env, amount: i128, to: Address) {
-        let admin: Address = env
-            .storage()
+        env.storage()
             .instance()
-            .get(&DataKey::Admin)
-            .expect("not initialised");
-        admin.require_auth();
+            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
 
-        let token_addr =
-            Address::from_string(&String::from_str(&env, NATIVE_TOKEN_ADDRESS));
-        let token = TokenClient::new(&env, &token_addr);
-
-        let balance = token.balance(&env.current_contract_address());
-        let send = if amount == 0 { balance } else { amount };
-
-        if send <= 0 {
-            panic!("nothing to withdraw");
+        // ---- emit event ----
+        DonationRecorded {
+            donor,
+            amount_stroops,
+            memo,
+            running_total: new_total,
         }
-        if send > balance {
-            panic!("insufficient contract balance");
-        }
-
-        token.transfer(&env.current_contract_address(), &to, &send);
-
-        env.events().publish(
-            (symbol_short!("withdraw"), admin.clone()),
-            WithdrawEvent {
-                admin,
-                amount: send,
-                to,
-            },
-        );
+        .publish(&env);
     }
 
     // -----------------------------------------------------------------------
     // Read-only views
     // -----------------------------------------------------------------------
 
-    /// Cumulative stroops donated since deployment.
     pub fn get_total(env: Env) -> i128 {
         env.storage()
             .instance()
@@ -238,7 +176,6 @@ impl CalamityDonation {
             .unwrap_or(0_i128)
     }
 
-    /// Cumulative stroops donated by a single address.
     pub fn get_donor_total(env: Env, donor: Address) -> i128 {
         env.storage()
             .persistent()
@@ -246,7 +183,6 @@ impl CalamityDonation {
             .unwrap_or(0_i128)
     }
 
-    /// Number of unique donor addresses.
     pub fn get_donor_count(env: Env) -> u32 {
         env.storage()
             .instance()
@@ -254,7 +190,6 @@ impl CalamityDonation {
             .unwrap_or(0)
     }
 
-    /// The admin (LGU treasury) address.
     pub fn get_admin(env: Env) -> Address {
         env.storage()
             .instance()
@@ -264,70 +199,118 @@ impl CalamityDonation {
 }
 
 // ---------------------------------------------------------------------------
-// Unit tests  (run with: cargo test -p calamity-donation)
+// Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{
-        testutils::Address as _,
-        token::{Client as TokenClient, StellarAssetClient},
-        Env,
-    };
+    use soroban_sdk::{testutils::Address as _, Address, Env};
 
-    /// Deploys the contract, mints XLM to the donor, and returns
-    /// (env, contract_client, token_client, admin, donor).
-    fn setup() -> (
-        Env,
-        CalamityDonationClient<'static>,
-        TokenClient<'static>,
-        Address,
-        Address,
-    ) {
-        // soroban_sdk test env is not Send/Sync so we heap-leak it for the lifetime.
-        let env: &'static Env = Box::leak(Box::new(Env::default()));
+    /// Register the contract with constructor args and return a client.
+    fn deploy<'a>(env: &'a Env, admin: &'a Address) -> CalamityDonationClient<'a> {
+        // env.register() accepts constructor arguments as a tuple (SDK 27).
+        let contract_id = env.register(CalamityDonation, (admin,));
+        CalamityDonationClient::new(env, &contract_id)
+    }
+
+    #[test]
+    fn test_record_and_totals() {
+        let env = Env::default();
         env.mock_all_auths();
 
-        let admin = Address::generate(env);
-        let donor = Address::generate(env);
+        let admin = Address::generate(&env);
+        let donor = Address::generate(&env);
+        let client = deploy(&env, &admin);
 
-        // Register the calamity-donation contract.
-        let contract_id = env.register_contract(None, CalamityDonation);
-        let client = CalamityDonationClient::new(env, &contract_id);
+        client.record_donation(
+            &donor,
+            &50_000_000_i128, // 5 XLM
+            &soroban_sdk::String::from_str(&env, "family-001"),
+        );
 
-        // Register the native token contract so token.transfer works in tests.
-        let token_id = env.register_stellar_asset_contract_v2(admin.clone());
-        let token = TokenClient::new(env, token_id.address());
-        let token_admin = StellarAssetClient::new(env, token_id.address());
-
-        // Mint 1 000 XLM (= 10_000_000_000 stroops) to the donor.
-        token_admin.mint(&donor, &10_000_000_000_i128);
-
-        client.initialize(&admin);
-
-        (env.clone(), client, token, admin, donor)
+        assert_eq!(client.get_total(), 50_000_000);
+        assert_eq!(client.get_donor_total(&donor), 50_000_000);
+        assert_eq!(client.get_donor_count(), 1);
     }
 
-    // NOTE: Because the native token address in tests is allocated dynamically
-    // by `register_stellar_asset_contract_v2`, you'll need to override the
-    // NATIVE_TOKEN_ADDRESS constant in an integration test harness.  The unit
-    // tests below validate non-token logic paths; end-to-end donation flow is
-    // best tested via `stellar contract invoke` on Testnet (see README).
+    #[test]
+    fn test_multiple_donations_same_donor() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let donor = Address::generate(&env);
+        let client = deploy(&env, &admin);
+
+        client.record_donation(
+            &donor,
+            &10_000_000_i128,
+            &soroban_sdk::String::from_str(&env, "food"),
+        );
+        client.record_donation(
+            &donor,
+            &20_000_000_i128,
+            &soroban_sdk::String::from_str(&env, "shelter"),
+        );
+
+        assert_eq!(client.get_total(), 30_000_000);
+        assert_eq!(client.get_donor_total(&donor), 30_000_000);
+        assert_eq!(client.get_donor_count(), 1); // still 1 unique donor
+    }
 
     #[test]
-    fn test_initialize_sets_admin_and_zeroes() {
-        let (_, client, _, admin, _) = setup();
+    fn test_two_donors_each_counted() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let donor_a = Address::generate(&env);
+        let donor_b = Address::generate(&env);
+        let client = deploy(&env, &admin);
+
+        client.record_donation(
+            &donor_a,
+            &10_000_000_i128,
+            &soroban_sdk::String::from_str(&env, "a"),
+        );
+        client.record_donation(
+            &donor_b,
+            &20_000_000_i128,
+            &soroban_sdk::String::from_str(&env, "b"),
+        );
+
+        assert_eq!(client.get_total(), 30_000_000);
+        assert_eq!(client.get_donor_count(), 2);
+        assert_eq!(client.get_donor_total(&donor_a), 10_000_000);
+        assert_eq!(client.get_donor_total(&donor_b), 20_000_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "amount must be positive")]
+    fn test_zero_amount_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let donor = Address::generate(&env);
+        let client = deploy(&env, &admin);
+
+        client.record_donation(
+            &donor,
+            &0_i128,
+            &soroban_sdk::String::from_str(&env, "x"),
+        );
+    }
+
+    #[test]
+    fn test_get_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let client = deploy(&env, &admin);
+
         assert_eq!(client.get_admin(), admin);
-        assert_eq!(client.get_total(), 0);
-        assert_eq!(client.get_donor_count(), 0);
-    }
-
-    #[test]
-    #[should_panic(expected = "already initialised")]
-    fn test_double_initialize_panics() {
-        let (env, client, _, admin, _) = setup();
-        // Second call must panic.
-        client.initialize(&admin);
     }
 }

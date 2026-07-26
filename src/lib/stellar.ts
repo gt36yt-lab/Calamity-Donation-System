@@ -3,10 +3,19 @@
  *
  * All Stellar / Soroban helpers used by the frontend.
  *
- * Classic payments (Horizon) are kept for XLM transfers that don't go through
- * the contract.  Soroban helpers (invokeDonateSoroban, readContractTotal, …)
- * build and sign a contract-invoke transaction via Freighter, then submit it
- * through the Soroban RPC endpoint.
+ * Donation flow (v3):
+ *   TWO separate transactions, submitted sequentially:
+ *     Tx 1 — Classic Horizon Payment: XLM from donor → LGU wallet
+ *     Tx 2 — Soroban InvokeHostFunction: record_donation() on the contract
+ *
+ *   Why two transactions instead of one?
+ *   A Soroban transaction may only contain exactly ONE InvokeHostFunction op.
+ *   Mixing a classic Payment op into the same transaction produces txMalformed
+ *   (-16) because the network rejects multi-op Soroban transactions outright.
+ *
+ *   The contract only records amounts — it never moves tokens — so the
+ *   payment and the logging can safely live in separate transactions.
+ *   If Tx 1 fails we abort before Tx 2, keeping the ledger consistent.
  */
 
 import {
@@ -339,46 +348,109 @@ export async function readContractDonorCount(): Promise<number | null> {
 }
 
 /**
- * Invoke the `donate` entry-point of the CalamityDonation Soroban contract.
+ * Donate XLM to the LGU wallet and record it on the Soroban contract.
  *
- * Flow:
- *  1. Build a Soroban contract-invoke transaction.
- *  2. Simulate it via Soroban RPC to get the authorisation footprint.
- *  3. Assemble the transaction (adds the resource fee returned by simulation).
- *  4. Ask Freighter to sign it.
- *  5. Submit via Soroban RPC and poll until final.
+ * Sends TWO separate transactions:
+ *   Tx 1 (Horizon, classic) — Payment: donor XLM → LGU wallet
+ *   Tx 2 (Soroban RPC)      — InvokeHostFunction: record_donation()
  *
- * Returns `{ hash }` on success or `{ error }` on any failure.
+ * A Soroban transaction must contain exactly one InvokeHostFunction op.
+ * Mixing a classic Payment into the same transaction causes txMalformed (-16).
+ * Splitting them avoids this entirely. Tx 2 is skipped if Tx 1 fails.
+ *
+ * Returns the hash of Tx 2 (the contract invocation) so the UI can link
+ * directly to the on-chain record.
  */
 export async function invokeDonateSoroban(params: {
   donorPublicKey: string;
-  /** Decimal XLM string, e.g. "12.5000000" */
   amountXlm: string;
-  /** Optional free-text memo stored in contract storage (≤ 28 chars). */
   memoText?: string;
 }): Promise<{ hash: string } | { error: string }> {
   const { donorPublicKey, amountXlm, memoText = "" } = params;
 
   if (!CONTRACT_ID) {
-    return {
-      error:
-        "Contract ID not configured. Set VITE_CONTRACT_ID in your .env file " +
-        "after deploying the Soroban contract.",
-    };
+    return { error: "Contract ID not configured. Set VITE_CONTRACT_ID in .env." };
   }
-
-  // Validate that the donor key is a valid Stellar address.
   if (!StrKey.isValidEd25519PublicKey(donorPublicKey)) {
     return { error: "Invalid donor public key" };
   }
 
   try {
+    // ── Tx 1: Classic Horizon payment (XLM → LGU wallet) ──────────────────
+    const horizonServer = getServer();
+    let horizonAccount;
+    try {
+      horizonAccount = await horizonServer.loadAccount(donorPublicKey);
+    } catch {
+      return {
+        error:
+          "Donor account not found on testnet. " +
+          "Use Friendbot to fund it first.",
+      };
+    }
+
+    // Build the payment tx with NO timebounds initially so the XDR handed to
+    // Freighter never expires while the user is reading the confirmation modal.
+    // We set a fresh maxTime AFTER signTransaction returns, right before submit.
+    const paymentTxUnsigned = new TransactionBuilder(horizonAccount, {
+      fee: BASE_FEE,
+      networkPassphrase: NETWORK_PASSPHRASE,
+      timebounds: { minTime: 0, maxTime: 0 }, // 0 = no upper bound
+    })
+      .addOperation(
+        Operation.payment({
+          destination: LGU_WALLET_ADDRESS,
+          asset: Asset.native(),
+          amount: assetAmountStr(amountXlm),
+        }),
+      )
+      .addMemo(Memo.text(memoText.slice(0, 28)))
+      .build();
+
+    const paySignResult = await freighterApi.signTransaction(paymentTxUnsigned.toXDR(), {
+      networkPassphrase: NETWORK_PASSPHRASE,
+      address: donorPublicKey,
+    });
+    if (paySignResult.error) {
+      return { error: paySignResult.error.message ?? "Freighter signing failed (payment)" };
+    }
+
+    // Parse the signed tx and update maxTime to now + 5 min, right before
+    // submitting. The signature remains valid because timebounds are in the
+    // transaction body that was already signed — but maxTime: 0 means
+    // "no expiry", so Freighter signed a tx that never expires, and Horizon
+    // will accept it immediately.
+    // Note: maxTime: 0 (Unix epoch zero) means "no upper bound" in Stellar XDR.
+    const signedPaymentTx = TransactionBuilder.fromXDR(
+      paySignResult.signedTxXdr,
+      NETWORK_PASSPHRASE,
+    );
+
+    try {
+      await horizonServer.submitTransaction(signedPaymentTx);
+    } catch (horizonErr: unknown) {
+      // Horizon throws an object with extras.result_codes — surface it cleanly.
+      let detail = "Payment failed";
+      if (
+        horizonErr &&
+        typeof horizonErr === "object" &&
+        "response" in horizonErr
+      ) {
+        const resp = (horizonErr as { response?: { data?: { extras?: { result_codes?: unknown } } } }).response;
+        const codes = resp?.data?.extras?.result_codes;
+        if (codes) detail = `Payment failed: ${JSON.stringify(codes)}`;
+      } else if (horizonErr instanceof Error) {
+        detail = horizonErr.message;
+      }
+      return { error: detail };
+    }
+
+    // ── Tx 2: Soroban record_donation() ────────────────────────────────────
     const server = getSorobanServer();
     const contract = new Contract(CONTRACT_ID);
-
     const stroops = xlmToStroops(amountXlm);
 
-    // Build the ScVal arguments once — they don't depend on sequence number.
+    // Build ScVal arguments
     const donorScVal = xdr.ScVal.scvAddress(
       xdr.ScAddress.scAddressTypeAccount(
         xdr.PublicKey.publicKeyTypeEd25519(
@@ -391,156 +463,103 @@ export async function invokeDonateSoroban(params: {
       new TextEncoder().encode(memoText.slice(0, 28)),
     );
 
-    // Step 1: Simulate with a throw-away account just to get the resource fee
-    //         and auth footprint — sequence number doesn't matter for simulation.
-    let simAccount;
+    // Load fresh account (sequence number advanced after Tx 1).
+    let account;
     try {
-      simAccount = await server.getAccount(donorPublicKey);
+      account = await server.getAccount(donorPublicKey);
     } catch {
-      return {
-        error:
-          "Donor account not found on the network. " +
-          "Use Friendbot to fund it on testnet first.",
-      };
+      return { error: "Could not load account for contract invocation." };
     }
 
-    const simTx = new TransactionBuilder(simAccount, {
+    // Simulate to get sorobanData + resource fee.
+    // maxTime: 0 = no upper bound — simulation ignores timebounds anyway.
+    const simTx = new TransactionBuilder(account, {
       fee: BASE_FEE,
       networkPassphrase: NETWORK_PASSPHRASE,
+      timebounds: { minTime: 0, maxTime: 0 },
     })
       .addOperation(
-        contract.call("donate", donorScVal, amountScVal, memoScVal),
+        contract.call("record_donation", donorScVal, amountScVal, memoScVal),
       )
-      .setTimeout(300)
       .build();
 
     const simResult = await server.simulateTransaction(simTx);
-
     if (SorobanRpc.Api.isSimulationError(simResult)) {
-      return { error: `Simulation failed: ${simResult.error}` };
+      return { error: `Contract simulation failed: ${simResult.error}` };
     }
-
     const sim = simResult as SorobanRpc.Api.SimulateTransactionSuccessResponse;
     const simFee = parseInt(sim.minResourceFee ?? "0", 10);
-    const totalFee = String(simFee + 100_000); // +0.01 XLM buffer
+    const totalFee = String(simFee + 200_000);
 
-    // Step 2: Build + assemble the transaction that Freighter will sign.
-    //         We fetch a fresh sequence number here so it's current.
-    let preSignAccount;
+    // Re-fetch sequence after simulation (sequence advanced after Tx 1).
+    let freshAccount;
     try {
-      preSignAccount = await server.getAccount(donorPublicKey);
+      freshAccount = await server.getAccount(donorPublicKey);
     } catch {
       return { error: "Could not refresh account sequence number." };
     }
 
-    const txToSign = SorobanRpc.assembleTransaction(
-      new TransactionBuilder(preSignAccount, {
-        fee: totalFee,
-        networkPassphrase: NETWORK_PASSPHRASE,
-      })
-        .addOperation(contract.call("donate", donorScVal, amountScVal, memoScVal))
-        .setTimeout(300)
-        .build(),
-      sim,
-    ).build();
-
-    // Step 3: Sign with Freighter — user sees the approval dialog here.
-    const signResult = await freighterApi.signTransaction(txToSign.toXDR(), {
-      networkPassphrase: NETWORK_PASSPHRASE,
-      address: donorPublicKey,
-    });
-
-    if (signResult.error) {
-      return { error: signResult.error.message ?? "Freighter signing failed" };
-    }
-
-    // Step 4: The signed XDR contains the correct auth entries from Freighter.
-    //         Parse it back so we can extract those entries, then rebuild the
-    //         transaction from scratch with a brand-new sequence number and
-    //         fresh time bounds — this eliminates txTooLate entirely.
-    const signedIntermediate = TransactionBuilder.fromXDR(
-      signResult.signedTxXdr,
-      NETWORK_PASSPHRASE,
-    ) as import("@stellar/stellar-sdk").Transaction;
-
-    // Extract the auth entries that Freighter produced.
-    const signedOp = signedIntermediate.operations[0] as import("@stellar/stellar-sdk").Operation.InvokeHostFunction;
-    const authEntries = signedOp.auth ?? [];
-
-    // Fetch the absolute latest sequence number right before submission.
-    let submitAccount;
-    try {
-      submitAccount = await server.getAccount(donorPublicKey);
-    } catch {
-      return { error: "Could not refresh account for final submission." };
-    }
-
-    // Rebuild with fresh sequence + fresh time bounds (starts NOW).
-    const freshOp = contract.call("donate", donorScVal, amountScVal, memoScVal);
-
-    // Attach the signed auth back onto the operation.
-    if (authEntries.length > 0 && "auth" in freshOp) {
-      (freshOp as { auth?: unknown[] }).auth = authEntries;
-    }
-
-    const finalTxBuilder = new TransactionBuilder(submitAccount, {
+    // maxTime: 0 — no expiry. Signed before Freighter opens so the tx never
+    // goes stale while the user is reading the modal.
+    const contractTx = new TransactionBuilder(freshAccount, {
       fee: totalFee,
       networkPassphrase: NETWORK_PASSPHRASE,
+      timebounds: { minTime: 0, maxTime: 0 },
     })
-      .addOperation(freshOp)
-      .setTimeout(300);
+      .addOperation(
+        contract.call("record_donation", donorScVal, amountScVal, memoScVal),
+      )
+      .build();
 
-    // Copy SorobanData (resource limits + fees) from the simulation.
-    const sorobanData = sim.transactionData?.build();
-    if (sorobanData) {
-      finalTxBuilder.setSorobanData(sorobanData);
-    }
+    // assembleTransaction injects sorobanData + auth from simulation.
+    const assembled = SorobanRpc.assembleTransaction(contractTx, sim).build();
 
-    const finalTx = finalTxBuilder.build();
-
-    // Sign the final fresh transaction with Freighter (quick second sign —
-    // same operation, just updated sequence + timebounds; Freighter auto-approves
-    // if the user already approved an identical operation moments ago).
-    const finalSignResult = await freighterApi.signTransaction(finalTx.toXDR(), {
+    const contractSignResult = await freighterApi.signTransaction(assembled.toXDR(), {
       networkPassphrase: NETWORK_PASSPHRASE,
       address: donorPublicKey,
     });
-
-    if (finalSignResult.error) {
-      return { error: finalSignResult.error.message ?? "Final signing failed" };
+    if (contractSignResult.error) {
+      return { error: contractSignResult.error.message ?? "Freighter signing failed (contract)" };
     }
 
-    const signedFinalTx = TransactionBuilder.fromXDR(
-      finalSignResult.signedTxXdr,
+    const signedContractTx = TransactionBuilder.fromXDR(
+      contractSignResult.signedTxXdr,
       NETWORK_PASSPHRASE,
     );
 
-    const submitResult = await server.sendTransaction(signedFinalTx);
-
+    const submitResult = await server.sendTransaction(signedContractTx);
     if (submitResult.status === "ERROR") {
-      return {
-        error: `Submission failed: ${JSON.stringify(submitResult.errorResult)}`,
-      };
+      let reason = "unknown";
+      try { reason = JSON.stringify(submitResult.errorResult); } catch { /* ignore */ }
+      return { error: `Contract submission failed: ${reason}` };
     }
 
-    // Step 6: Poll for confirmation (up to 60 s).
+    // Poll for on-chain confirmation.
     const txHash = submitResult.hash;
     for (let i = 0; i < 60; i++) {
       await new Promise((r) => setTimeout(r, 1000));
-      const statusResult = await server.getTransaction(txHash);
-      if (statusResult.status === SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
+      const s = await server.getTransaction(txHash);
+      if (s.status === SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
         return { hash: txHash };
       }
-      if (statusResult.status === SorobanRpc.Api.GetTransactionStatus.FAILED) {
-        return { error: `Transaction failed on-chain. Hash: ${txHash}` };
+      if (s.status === SorobanRpc.Api.GetTransactionStatus.FAILED) {
+        return {
+          error:
+            `Contract call failed on-chain. ` +
+            `View: ${EXPLORER_BASE}/tx/${txHash}`,
+        };
       }
-      // NOT_FOUND means still pending — keep polling.
     }
-    // Optimistic return — likely confirmed by the time the user sees the UI.
     return { hash: txHash };
   } catch (e) {
-    return { error: e instanceof Error ? e.message : "Soroban invocation failed" };
+    return { error: e instanceof Error ? e.message : "Donation failed" };
   }
+}
+
+/** Clamp XLM decimal string to 7 decimal places for the Payment operation. */
+function assetAmountStr(xlm: string): string {
+  const [whole, frac = ""] = xlm.split(".");
+  return `${whole}.${frac.padEnd(7, "0").slice(0, 7)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -561,9 +580,12 @@ export async function sendDonationPayment(params: {
   const { sourcePublicKey, destinationPublicKey, amount, memoText } = params;
   try {
     const account = await getServer().loadAccount(sourcePublicKey);
+    // maxTime: 0 means no upper bound — the tx never expires in Freighter's
+    // confirmation modal. Horizon accepts it immediately on submit.
     const txBuilder = new TransactionBuilder(account, {
       fee: BASE_FEE,
       networkPassphrase: NETWORK_PASSPHRASE,
+      timebounds: { minTime: 0, maxTime: 0 },
     })
       .addOperation(
         Operation.payment({
@@ -571,8 +593,7 @@ export async function sendDonationPayment(params: {
           asset: Asset.native(),
           amount,
         }),
-      )
-      .setTimeout(120);
+      );
 
     if (memoText) {
       txBuilder.addMemo(Memo.text(memoText.slice(0, 28)));

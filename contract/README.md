@@ -1,228 +1,190 @@
 # CalamityDonation — Soroban Smart Contract
 
-Accepts native XLM donations on the Stellar testnet, tracks per-donor totals
-on-chain, and lets an authorised LGU admin withdraw accumulated funds to the
-treasury wallet.
+Records XLM donations on-chain for the TranspaRelief system.
+The contract is a **ledger only** — it never holds or moves tokens.
+Actual XLM is sent via a classic Horizon Payment to the LGU wallet;
+the contract records the amount, donor, and memo for public auditability.
 
 ---
 
 ## Prerequisites
 
-| Tool | Version | Install |
-|------|---------|---------|
-| Rust + cargo | stable ≥ 1.76 | `rustup update stable` |
-| wasm32 target | any | `rustup target add wasm32-unknown-unknown` |
-| Stellar CLI | ≥ 0.9 | see below |
-| Freighter extension | ≥ 4.x | https://www.freighter.app/ |
-
-### Install the Stellar CLI
+| Tool | Version |
+|------|---------|
+| Rust + cargo | stable ≥ 1.78 |
+| `wasm32v1-none` target | see below |
+| Stellar CLI | ≥ 27.x |
 
 ```powershell
-# Windows (PowerShell) — installs via cargo
-cargo install --locked stellar-cli --features opt
-```
+# Add the correct WASM target (required by Stellar CLI v21+)
+rustup target add wasm32v1-none
 
-Or download a pre-built binary from
-https://github.com/stellar/stellar-cli/releases and add it to your `PATH`.
-
-Verify:
-
-```powershell
-stellar --version
+# Verify Stellar CLI
+stellar --version   # should print 27.x.x
 ```
 
 ---
 
-## 1 — Configure Freighter for Testnet
+## Contract entry-points
 
-1. Open the Freighter browser extension.
-2. Click the network selector (top-right).
-3. Choose **Test Net**.
-4. Make a note of your public key — this becomes your **admin address**.
+| Function | Auth | Description |
+|----------|------|-------------|
+| `__constructor(admin)` | admin | Runs once at deploy time — sets admin and zeroes counters |
+| `record_donation(donor, amount_stroops, memo)` | donor | Logs a donation; does not move tokens |
+| `get_total()` | — | Cumulative stroops recorded |
+| `get_donor_total(donor)` | — | One donor's cumulative stroops |
+| `get_donor_count()` | — | Number of unique donors |
+| `get_admin()` | — | Admin address |
+
+`amount_stroops` is a signed 64-bit integer — 1 XLM = 10 000 000 stroops.
 
 ---
 
-## 2 — Fund your admin account with Friendbot
+## Build
+
+Run from the **workspace root** (the folder that contains `Cargo.toml`):
 
 ```powershell
-stellar keys generate --network testnet admin
-stellar keys address admin          # copy the G... address
-
-# Fund it (100 XLM)
-curl "https://friendbot.stellar.org?addr=<YOUR_ADMIN_G_ADDRESS>"
+stellar contract build
 ```
 
-Or use the **Fund with Friendbot** button on the Donate page after connecting
-your Freighter wallet.
+Output:
 
----
+```
+target/wasm32v1-none/release/calamity_donation.wasm
+```
 
-## 3 — Build the contract
-
-Run from the **workspace root** (the folder that contains `Cargo.toml` and the
-`contract/` directory):
+Run tests (native, no WASM toolchain needed):
 
 ```powershell
-cd "c:\Users\Evan\Desktop\test\Calamity-Donation-System"
-
-cargo build --manifest-path contract/Cargo.toml --target wasm32-unknown-unknown --release
+cargo test --manifest-path contract/Cargo.toml
 ```
-
-The compiled WASM lands at:
-
-```
-target/wasm32-unknown-unknown/release/calamity_donation.wasm
-```
-
-> Tip: if you get `error[E0463]: can't find crate for 'std'`, run
-> `rustup target add wasm32-unknown-unknown` first.
 
 ---
 
-## 4 — Deploy to Stellar Testnet
+## Deploy to Stellar Testnet
+
+### 1. Create and fund a test identity
+
+```powershell
+stellar keys generate alice --network testnet --fund
+stellar keys address alice   # copy the G… address — this is your admin
+```
+
+### 2. Deploy
+
+The `--` separator passes constructor arguments.
+`--admin alice` resolves to alice's public key automatically.
 
 ```powershell
 stellar contract deploy `
-  --wasm target/wasm32-unknown-unknown/release/calamity_donation.optimized.wasm `
-  --source admin `
-  --network testnet
-```
-
-> Note: always optimize before deploying. Rust 1.87+ emits reference-types
-> by default which Stellar's VM rejects. The optimize step strips it out.
-> Run `stellar contract optimize` first if you haven't already:
-> `stellar contract optimize --wasm target/wasm32-unknown-unknown/release/calamity_donation.wasm`
-
-The command prints a **contract ID** that looks like:
-
-```
-CXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
-```
-
-Copy it — you'll need it in the next step.
-
----
-
-## 5 — Initialise the contract
-
-The `initialize` entry-point must be called once right after deployment.  Pass
-your admin (LGU treasury) public key as the argument.
-
-```powershell
-stellar contract invoke `
-  --id  <CONTRACT_ID> `
-  --source admin `
+  --wasm target/wasm32v1-none/release/calamity_donation.wasm `
+  --source-account alice `
   --network testnet `
-  -- initialize `
-  --admin <YOUR_ADMIN_G_ADDRESS>
+  -- --admin alice
 ```
 
-Verify it worked:
+The command prints a contract address (`C…`). Copy it.
+
+### 3. Verify deployment
 
 ```powershell
 stellar contract invoke `
-  --id  <CONTRACT_ID> `
-  --source admin `
+  --id <CONTRACT_ID> `
+  --source-account alice `
   --network testnet `
   -- get_admin
-```
+# prints alice's public key
 
-Should print your admin address.
+stellar contract invoke `
+  --id <CONTRACT_ID> `
+  --source-account alice `
+  --network testnet `
+  -- get_total
+# prints "0"
+```
 
 ---
 
-## 6 — Wire the contract into the frontend
+## Wire into the frontend
 
-Copy `.env.example` to `.env` in the project root and fill in the values:
+Copy `.env.example` to `.env` and fill in your values:
 
 ```powershell
 Copy-Item .env.example .env
 ```
 
-Edit `.env`:
-
 ```env
 VITE_STELLAR_NETWORK=testnet
-VITE_LGU_WALLET=<YOUR_ADMIN_G_ADDRESS>
+VITE_LGU_WALLET=<YOUR_LGU_G_ADDRESS>
 VITE_CONTRACT_ID=<CONTRACT_ID>
 ```
 
-Then start the dev server:
+Start the dev server:
 
 ```powershell
 npm run dev
 ```
 
-The Donate page will now route XLM donations through the Soroban contract.
-The Dashboard will show the live contract total and donor count.
+The Donate page will now send two transactions on each donation:
+1. **Classic Horizon Payment** — XLM from the donor's wallet to `VITE_LGU_WALLET`
+2. **Soroban InvokeHostFunction** — calls `record_donation()` to log it on-chain
+
+Both are signed by Freighter in sequence.
 
 ---
 
-## 7 — Make a test donation
-
-1. Open `http://localhost:5173/donate` in Chrome/Brave with Freighter installed.
-2. Make sure Freighter is on **Test Net**.
-3. Connect your wallet and click **Fund with Friendbot** if your balance is 0.
-4. Choose an amount in XLM and click **Sign & send**.
-5. Freighter will show an approval dialog — click **Approve**.
-6. Watch the "Confirming on-chain…" spinner; when it resolves you'll see a
-   transaction hash linked to Stellar Expert.
-
-To confirm the contract recorded the donation:
+## Make a test donation via CLI
 
 ```powershell
 stellar contract invoke `
-  --id  <CONTRACT_ID> `
-  --source admin `
+  --id <CONTRACT_ID> `
+  --source-account alice `
+  --network testnet `
+  --send=yes `
+  -- record_donation `
+  --donor alice `
+  --amount_stroops 10000000 `
+  --memo "test-donation"
+```
+
+Then read it back:
+
+```powershell
+stellar contract invoke `
+  --id <CONTRACT_ID> `
+  --source-account alice `
   --network testnet `
   -- get_total
+# "10000000"  (= 1 XLM)
 
 stellar contract invoke `
-  --id  <CONTRACT_ID> `
-  --source admin `
+  --id <CONTRACT_ID> `
+  --source-account alice `
   --network testnet `
   -- get_donor_count
+# "1"
 ```
 
 ---
 
-## 8 — Withdraw funds (admin only)
+## Storage layout
 
-Move all accumulated XLM from the contract to the LGU treasury wallet:
+| Key | Type | TTL | Description |
+|-----|------|-----|-------------|
+| `Admin` | `Address` | instance | LGU treasury / admin |
+| `Total` | `i128` | instance | Cumulative stroops recorded |
+| `DonorCount` | `u32` | instance | Unique donor count |
+| `DonorTotal(address)` | `i128` | persistent | Per-donor cumulative stroops |
 
-```powershell
-stellar contract invoke `
-  --id  <CONTRACT_ID> `
-  --source admin `
-  --network testnet `
-  -- withdraw `
-  --amount 0 `
-  --to <DESTINATION_G_ADDRESS>
-```
-
-Pass `--amount 0` to sweep the full balance, or a specific stroop amount
-(1 XLM = 10 000 000 stroops) to withdraw a partial amount.
-
----
-
-## Contract entry-points reference
-
-| Function | Auth | Arguments | Returns |
-|----------|------|-----------|---------|
-| `initialize` | admin | `admin: Address` | — |
-| `donate` | donor | `donor: Address`, `amount: i128` (stroops), `memo: String` | — |
-| `withdraw` | admin | `amount: i128` (0 = all), `to: Address` | — |
-| `get_total` | — | — | `i128` stroops |
-| `get_donor_total` | — | `donor: Address` | `i128` stroops |
-| `get_donor_count` | — | — | `u32` |
-| `get_admin` | — | — | `Address` |
+Instance entries are extended to 60 days on every write.
+Persistent donor entries are extended to 60 days on every donation.
 
 ---
 
 ## Useful links
 
-- Stellar testnet explorer: https://stellar.expert/explorer/testnet
-- Freighter wallet: https://www.freighter.app/
+- Deployed contract: https://stellar.expert/explorer/testnet/contract/CAASYYOOPJWHMF2KN5GNZAMKIEHEE77ODJ46GQIPJ3MTUHV45R5HLLLD
 - Stellar CLI docs: https://developers.stellar.org/docs/tools/stellar-cli
 - Soroban docs: https://developers.stellar.org/docs/smart-contracts
 - Friendbot: https://friendbot.stellar.org

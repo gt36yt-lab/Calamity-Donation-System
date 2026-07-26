@@ -442,8 +442,8 @@ export default function DonatePage() {
             </div>
             {usedContract && (
               <p className="mt-1 text-xs text-verified-600/80">
-                Your XLM was transferred into the CalamityDonation contract
-                and your donor total updated on-chain.
+                Your XLM was sent to the LGU wallet and your donation
+                recorded on-chain by the CalamityDonation contract.
               </p>
             )}
             <a

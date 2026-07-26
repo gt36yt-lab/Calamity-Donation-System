@@ -9,11 +9,6 @@ import AdminPage from "./pages/AdminPage";
 import DonatePage from "./pages/DonatePage";
 import NotFoundPage from "./pages/NotFoundPage";
 
-// CONTRACT_ID is read from VITE_CONTRACT_ID in .env (see .env.example).
-// It is re-exported here for any component that imports from App rather than
-// stellar.ts directly, but the canonical source is src/lib/stellar.ts.
-export { CONTRACT_ID } from "./lib/stellar";
-
 export default function App() {
   return (
     <WalletProvider>
