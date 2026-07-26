@@ -9,9 +9,6 @@ import AdminPage from "./pages/AdminPage";
 import DonatePage from "./pages/DonatePage";
 import NotFoundPage from "./pages/NotFoundPage";
 
-// 🚀 YOUR LIVE SOROBAN CONTRACT ID (STELLAR TESTNET)
-export const CONTRACT_ID = "CCOCEO3SOJDD3VQ2JPCV7LS6QRZYT67CFRBDIB7UOZLB6IY2FQCDF3NS";
-
 export default function App() {
   return (
     <WalletProvider>

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { AlertTriangle, ExternalLink, MapPin, Radio, Users } from "lucide-react";
+import { AlertTriangle, ExternalLink, MapPin, Radio, Users, Zap } from "lucide-react";
 import {
   calamitySummary,
   getShortfallPhp,
@@ -9,10 +9,14 @@ import {
 } from "../../data/mockData";
 import { formatDate, formatNumber, formatPhp } from "../../lib/format";
 import {
+  CONTRACT_ID,
   EXPLORER_BASE,
   LGU_WALLET_ADDRESS,
   NETWORK,
   fetchAccountBalances,
+  readContractDonorCount,
+  readContractTotal,
+  stroopsToXlm,
   type WalletBalance,
 } from "../../lib/stellar";
 import { MouseTooltip } from "../ui/MouseTooltip";
@@ -43,11 +47,25 @@ export function HeroStats() {
 
   const [balances, setBalances] = useState<WalletBalance[] | null | "loading">("loading");
 
+  /** Live on-chain total from Soroban contract (stroops as bigint, null = not available). */
+  const [contractTotal, setContractTotal] = useState<bigint | null | "loading">("loading");
+  const [contractDonors, setContractDonors] = useState<number | null>(null);
+
   useEffect(() => {
     let cancelled = false;
-    fetchAccountBalances(LGU_WALLET_ADDRESS).then((res) => {
-      if (!cancelled) setBalances(res);
+
+    // Fetch Horizon balances + Soroban contract stats in parallel.
+    Promise.all([
+      fetchAccountBalances(LGU_WALLET_ADDRESS),
+      readContractTotal(),
+      readContractDonorCount(),
+    ]).then(([bal, total, donors]) => {
+      if (cancelled) return;
+      setBalances(bal);
+      setContractTotal(total);
+      setContractDonors(donors);
     });
+
     return () => {
       cancelled = true;
     };
@@ -213,6 +231,46 @@ export function HeroStats() {
             </li>
           </ul>
         </MouseTooltip>
+
+        {/* Soroban contract live stats */}
+        {CONTRACT_ID && (
+          <div className="mt-4 flex flex-col gap-3 rounded-xl border border-signal-700/40 bg-signal-900/10 p-5 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <span className="font-mono text-[10px] uppercase tracking-widest text-signal-400 flex items-center gap-1.5">
+                <Zap className="h-3 w-3" /> Soroban Contract · live
+              </span>
+              <div className="mt-1 font-mono text-xs text-paper-300">
+                {CONTRACT_ID.slice(0, 10)}…{CONTRACT_ID.slice(-6)} · {NETWORK}
+              </div>
+            </div>
+            <div className="flex items-center gap-6">
+              <div className="text-center">
+                <div className="font-mono-num text-xl font-bold text-paper-50">
+                  {contractTotal === "loading"
+                    ? "…"
+                    : contractTotal === null
+                      ? "—"
+                      : `${Number(stroopsToXlm(contractTotal)).toLocaleString(undefined, { maximumFractionDigits: 2 })} XLM`}
+                </div>
+                <div className="text-[10px] text-paper-400 uppercase tracking-wide">total donated</div>
+              </div>
+              <div className="text-center">
+                <div className="font-mono-num text-xl font-bold text-paper-50">
+                  {contractDonors === null ? "—" : contractDonors.toLocaleString()}
+                </div>
+                <div className="text-[10px] text-paper-400 uppercase tracking-wide">unique donors</div>
+              </div>
+              <a
+                href={`${EXPLORER_BASE}/contract/${CONTRACT_ID}`}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-1 text-xs font-medium text-signal-400 hover:text-signal-300"
+              >
+                Contract <ExternalLink className="h-3 w-3" />
+              </a>
+            </div>
+          </div>
+        )}
 
         {/* Stellar wallet tracker */}
         <div className="mt-4 flex flex-col gap-3 rounded-xl border border-verified-700/40 bg-verified-900/10 p-5 sm:flex-row sm:items-center sm:justify-between">

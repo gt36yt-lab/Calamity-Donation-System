@@ -9,6 +9,7 @@ import {
   Loader2,
   Package,
   Wallet,
+  Zap,
 } from "lucide-react";
 import { useWallet } from "../context/WalletContext";
 import {
@@ -19,16 +20,22 @@ import {
 } from "../data/mockData";
 import { formatAsset, formatNumber, formatPhp, phpToAsset, truncateAddress } from "../lib/format";
 import {
+  CONTRACT_ID,
   EXPLORER_BASE,
   LGU_WALLET_ADDRESS,
   NETWORK,
+  SOROBAN_RPC_URL,
   fundWithFriendbot,
+  invokeDonateSoroban,
   sendDonationPayment,
 } from "../lib/stellar";
 
 type Asset = "XLM" | "USDC" | "PHPC";
 const ASSETS: Asset[] = ["XLM", "USDC", "PHPC"];
 const PRESETS_PHP = [500, 1500, 5000, 15000];
+
+/** True when a live contract ID has been configured. */
+const CONTRACT_READY = CONTRACT_ID.length > 0;
 
 export default function DonatePage() {
   const [params] = useSearchParams();
@@ -57,14 +64,20 @@ export default function DonatePage() {
   });
 
   const [friendbotState, setFriendbotState] = useState<"idle" | "loading" | "done" | "error">("idle");
-  const [sendState, setSendState] = useState<"idle" | "signing" | "done" | "error">("idle");
+  const [sendState, setSendState] = useState<"idle" | "signing" | "submitting" | "done" | "error">("idle");
   const [txHash, setTxHash] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  /** Whether the last successful tx went through the Soroban contract. */
+  const [usedContract, setUsedContract] = useState(false);
 
   const rate = assetRates.find((r) => r.asset === asset)?.phpRate ?? 1;
   const assetAmount = phpToAsset(phpAmount, rate);
 
-  const memoText = family ? `${family.id} relief` : item ? `${item.id} supply` : "TranspaRelief donation";
+  const memoText = family
+    ? `${family.id} relief`
+    : item
+      ? `${item.id} supply`
+      : "TranspaRelief donation";
 
   async function handleFriendbot() {
     if (!address) return;
@@ -77,6 +90,34 @@ export default function DonatePage() {
     if (!address) return;
     setSendState("signing");
     setErrorMsg(null);
+    setTxHash(null);
+    setUsedContract(false);
+
+    // --- Path A: Soroban contract (XLM only, contract must be deployed) ---
+    if (asset === "XLM" && CONTRACT_READY) {
+      const xlmStr = assetAmount.toFixed(7);
+      // Phase label: signing
+      setSendState("signing");
+      const result = await invokeDonateSoroban({
+        donorPublicKey: address,
+        amountXlm: xlmStr,
+        memoText,
+      });
+      if ("error" in result) {
+        setSendState("error");
+        setErrorMsg(result.error);
+        return;
+      }
+      // While we were waiting the state may still be "signing"; flip to submitting
+      // to show the polling banner, then done when the hash comes back.
+      setSendState("submitting");
+      setTxHash(result.hash);
+      setSendState("done");
+      setUsedContract(true);
+      return;
+    }
+
+    // --- Path B: Classic XLM Horizon payment (fallback / non-XLM) ---
     const result = await sendDonationPayment({
       sourcePublicKey: address,
       destinationPublicKey: LGU_WALLET_ADDRESS,
@@ -99,10 +140,13 @@ export default function DonatePage() {
       : "Fund the general calamity wallet";
 
   const subhead = family
-    ? `Your donation is memo-tagged for ${family.id} and appears on the public ledger feed within seconds.`
+    ? `Your donation is recorded on-chain via the Soroban contract and tagged for ${family.id}.`
     : item
-      ? `Your donation is memo-tagged for ${item.name} and appears on the public ledger feed within seconds.`
-      : "Your donation lands directly in the LGU treasury wallet and appears on the public ledger feed within seconds.";
+      ? `Your donation is recorded on-chain via the Soroban contract and tagged for ${item.name}.`
+      : "Your donation is recorded on-chain by the CalamityDonation Soroban contract and visible on the public ledger within seconds.";
+
+  const isBusy = sendState === "signing" || sendState === "submitting";
+  const canSend = status === "connected" && asset === "XLM" && !isBusy;
 
   return (
     <div className="mx-auto max-w-3xl px-4 py-12 sm:px-6">
@@ -111,6 +155,27 @@ export default function DonatePage() {
       </span>
       <h1 className="mt-1 font-display text-3xl font-bold text-ink-950">{heading}</h1>
       <p className="mt-2 max-w-xl text-sm text-khaki-700">{subhead}</p>
+
+      {/* Contract status pill */}
+      <div className="mt-3 inline-flex items-center gap-1.5 rounded-full border border-paper-300 bg-paper-50 px-3 py-1 text-[11px] font-mono text-khaki-600">
+        <Zap className={`h-3 w-3 ${CONTRACT_READY ? "text-verified-500" : "text-khaki-400"}`} />
+        {CONTRACT_READY ? (
+          <>
+            Contract:{" "}
+            <a
+              href={`${EXPLORER_BASE}/contract/${CONTRACT_ID}`}
+              target="_blank"
+              rel="noreferrer"
+              className="text-verified-600 underline hover:text-verified-500"
+            >
+              {CONTRACT_ID.slice(0, 8)}…{CONTRACT_ID.slice(-6)}
+            </a>
+            {" · "}{NETWORK}
+          </>
+        ) : (
+          "Contract not deployed — set VITE_CONTRACT_ID in .env"
+        )}
+      </div>
 
       {family && (
         <div className="mt-4 rounded-xl border border-paper-300 bg-paper-50 p-4 text-sm">
@@ -147,7 +212,7 @@ export default function DonatePage() {
         </div>
       )}
 
-      {/* Step 1: Connect */}
+      {/* ── Step 1: Connect ── */}
       <section className="mt-8 rounded-xl border border-paper-300 bg-paper-50 p-6">
         <div className="flex items-center justify-between">
           <h2 className="font-display text-base font-bold text-ink-950">
@@ -186,7 +251,7 @@ export default function DonatePage() {
                 and refresh.
               </p>
             )}
-            {status === "error" && errorMsg === null && (
+            {status === "error" && (
               <p className="mt-3 text-xs text-alert-600">Connection was declined.</p>
             )}
           </div>
@@ -198,7 +263,9 @@ export default function DonatePage() {
             <div className="flex items-center gap-3">
               {Array.isArray(balances) && balances.length > 0 && (
                 <span className="font-mono-num text-xs text-khaki-700">
-                  {Number(balances[0].balance).toLocaleString(undefined, { maximumFractionDigits: 2 })}{" "}
+                  {Number(balances[0].balance).toLocaleString(undefined, {
+                    maximumFractionDigits: 2,
+                  })}{" "}
                   {balances[0].code}
                 </span>
               )}
@@ -222,7 +289,7 @@ export default function DonatePage() {
         )}
       </section>
 
-      {/* Step 2: Amount */}
+      {/* ── Step 2: Amount ── */}
       <section className="mt-4 rounded-xl border border-paper-300 bg-paper-50 p-6">
         <h2 className="font-display text-base font-bold text-ink-950">
           2. Choose an amount
@@ -275,7 +342,8 @@ export default function DonatePage() {
         {item && (
           <p className="mt-3 text-xs text-khaki-600">
             ≈ {formatNumber(Math.max(1, Math.round(phpAmount / item.unitCostPhp)))} {item.unit}
-            {Math.round(phpAmount / item.unitCostPhp) !== 1 ? "s" : ""} of {item.name.toLowerCase()}
+            {Math.round(phpAmount / item.unitCostPhp) !== 1 ? "s" : ""} of{" "}
+            {item.name.toLowerCase()}
           </p>
         )}
 
@@ -292,55 +360,92 @@ export default function DonatePage() {
         {asset !== "XLM" && (
           <p className="mt-3 flex items-start gap-1.5 text-xs text-khaki-600">
             <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-            {asset} requires a trustline to its issuer before Freighter can
-            sign a transfer. This demo submits native XLM payments only —
-            switch to XLM to try the live signing flow.
+            The Soroban contract currently accepts native XLM only. Switch to
+            XLM to use the live contract path.
           </p>
         )}
       </section>
 
-      {/* Step 3: Confirm & send */}
+      {/* ── Step 3: Confirm & send ── */}
       <section className="mt-4 rounded-xl border border-paper-300 bg-paper-50 p-6">
         <h2 className="font-display text-base font-bold text-ink-950">
           3. Confirm &amp; sign
         </h2>
+
         <div className="mt-3 space-y-1.5 text-xs text-khaki-700">
+          <div className="flex justify-between">
+            <span>Route</span>
+            <span className="font-mono">
+              {asset === "XLM" && CONTRACT_READY
+                ? "Soroban contract → LGU wallet"
+                : "Classic Horizon payment → LGU wallet"}
+            </span>
+          </div>
+          {asset === "XLM" && CONTRACT_READY && (
+            <div className="flex justify-between">
+              <span>Contract</span>
+              <span className="font-mono">
+                {CONTRACT_ID.slice(0, 8)}…{CONTRACT_ID.slice(-6)}
+              </span>
+            </div>
+          )}
           <div className="flex justify-between">
             <span>Destination</span>
             <span className="font-mono">{truncateAddress(LGU_WALLET_ADDRESS)}</span>
           </div>
           <div className="flex justify-between">
-            <span>Memo</span>
+            <span>Memo tag</span>
             <span className="font-mono">{memoText}</span>
           </div>
           <div className="flex justify-between">
             <span>Network</span>
             <span className="font-mono capitalize">{NETWORK}</span>
           </div>
+          <div className="flex justify-between">
+            <span>RPC</span>
+            <span className="font-mono truncate max-w-[200px]">{SOROBAN_RPC_URL.replace("https://", "")}</span>
+          </div>
         </div>
 
         <button
           type="button"
           onClick={handleSend}
-          disabled={status !== "connected" || asset !== "XLM" || sendState === "signing"}
+          disabled={!canSend}
           className="mt-5 inline-flex w-full items-center justify-center gap-2 rounded-full bg-verified-500 px-5 py-3 text-sm font-semibold text-ink-950 hover:bg-verified-400 disabled:cursor-not-allowed disabled:opacity-50"
         >
-          {sendState === "signing" ? (
+          {sendState === "signing" && (
             <>
               <Loader2 className="h-4 w-4 animate-spin" /> Waiting for Freighter…
             </>
-          ) : (
+          )}
+          {sendState === "submitting" && (
             <>
-              Sign &amp; send {formatAsset(assetAmount, asset)} <ArrowRight className="h-4 w-4" />
+              <Loader2 className="h-4 w-4 animate-spin" /> Confirming on-chain…
+            </>
+          )}
+          {(sendState === "idle" || sendState === "done" || sendState === "error") && (
+            <>
+              Sign &amp; send {formatAsset(assetAmount, asset)}{" "}
+              <ArrowRight className="h-4 w-4" />
             </>
           )}
         </button>
 
+        {/* Success receipt */}
         {sendState === "done" && txHash && (
           <div className="mt-4 rounded-lg border border-verified-500/30 bg-verified-500/8 p-4 text-sm text-verified-700">
             <div className="flex items-center gap-1.5 font-semibold">
-              <CheckCircle2 className="h-4 w-4" /> Donation confirmed on Stellar
+              <CheckCircle2 className="h-4 w-4" />
+              {usedContract
+                ? "Donation recorded by Soroban contract"
+                : "Donation confirmed on Stellar"}
             </div>
+            {usedContract && (
+              <p className="mt-1 text-xs text-verified-600/80">
+                Your XLM was sent to the LGU wallet and your donation
+                recorded on-chain by the CalamityDonation contract.
+              </p>
+            )}
             <a
               href={`${EXPLORER_BASE}/tx/${txHash}`}
               target="_blank"
@@ -352,6 +457,7 @@ export default function DonatePage() {
           </div>
         )}
 
+        {/* Error */}
         {sendState === "error" && (
           <div className="mt-4 flex items-start gap-1.5 rounded-lg border border-alert-500/30 bg-alert-500/8 p-4 text-xs text-alert-700">
             <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
