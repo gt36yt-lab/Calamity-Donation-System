@@ -9,8 +9,10 @@ import AdminPage from "./pages/AdminPage";
 import DonatePage from "./pages/DonatePage";
 import NotFoundPage from "./pages/NotFoundPage";
 
-// 🚀 YOUR LIVE SOROBAN CONTRACT ID (STELLAR TESTNET)
-export const CONTRACT_ID = "CCOCEO3SOJDD3VQ2JPCV7LS6QRZYT67CFRBDIB7UOZLB6IY2FQCDF3NS";
+// CONTRACT_ID is read from VITE_CONTRACT_ID in .env (see .env.example).
+// It is re-exported here for any component that imports from App rather than
+// stellar.ts directly, but the canonical source is src/lib/stellar.ts.
+export { CONTRACT_ID } from "./lib/stellar";
 
 export default function App() {
   return (
