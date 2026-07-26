@@ -1,0 +1,151 @@
+@import "tailwindcss";
+
+@theme {
+  /* Type */
+  --font-display: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
+  --font-body: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", monospace;
+
+  /* Color: manifest & storm-chart palette — tuned for urgency */
+  --color-ink-1000: #060b12;
+  --color-ink-950: #0a1420;
+  --color-ink-900: #101d2c;
+  --color-ink-800: #172940;
+  --color-ink-700: #223a56;
+
+  --color-paper-50: #fbf8f0;
+  --color-paper-100: #f4eee0;
+  --color-paper-200: #e9ded0;
+  --color-paper-300: #d8c7a8;
+  --color-paper-400: #c2ab84;
+
+  --color-khaki-500: #a08a5a;
+  --color-khaki-600: #8a7550;
+  --color-khaki-700: #6b5a3e;
+
+  --color-signal-400: #ffa53d;
+  --color-signal-500: #ff8a1f;
+  --color-signal-600: #e56a00;
+  --color-signal-700: #b85400;
+
+  --color-verified-400: #38c9a8;
+  --color-verified-500: #16a085;
+  --color-verified-600: #0e7a64;
+  --color-verified-700: #0a5c4c;
+
+  /* Softer, muted teal-blue reserved for the LGU Treasury Wallet display —
+     same trustworthy family as verified, but desaturated so it reads as
+     calm rather than shouting. Spot-ability comes from the pill + icon
+     treatment, not from color intensity. */
+  --color-treasury-200: #dcebe8;
+  --color-treasury-300: #b3d4cd;
+  --color-treasury-400: #7fb8ac;
+  --color-treasury-500: #5a9c8f;
+  --color-treasury-600: #457d72;
+  --color-treasury-700: #345f57;
+
+  --color-alert-400: #ff6b5e;
+  --color-alert-500: #f23b2c;
+  --color-alert-600: #c92a1d;
+  --color-alert-700: #9e1f15;
+
+  --color-text-900: #14202c;
+}
+
+@layer base {
+  html {
+    scroll-behavior: smooth;
+  }
+
+  body {
+    background-color: var(--color-paper-100);
+    color: var(--color-text-900);
+    font-family: var(--font-body);
+    background-image:
+      linear-gradient(rgba(11, 29, 46, 0.035) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(11, 29, 46, 0.035) 1px, transparent 1px);
+    background-size: 28px 28px;
+  }
+
+  h1, h2, h3, h4 {
+    font-family: var(--font-display);
+  }
+
+  ::selection {
+    background-color: var(--color-signal-400);
+    color: var(--color-ink-950);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-signal-500);
+    outline-offset: 2px;
+  }
+}
+
+@layer utilities {
+  /* Radar / orbit contour rings used behind hero + wallet blocks */
+  .contour-rings {
+    background-image:
+      repeating-radial-gradient(
+        circle at 82% 15%,
+        rgba(255, 138, 31, 0.14) 0px,
+        rgba(255, 138, 31, 0.14) 1px,
+        transparent 1px,
+        transparent 46px
+      );
+  }
+
+  .hero-glow {
+    background-image:
+      radial-gradient(ellipse 900px 500px at 80% -10%, rgba(242, 59, 44, 0.28), transparent 60%),
+      radial-gradient(ellipse 700px 500px at 10% 110%, rgba(255, 138, 31, 0.16), transparent 60%);
+  }
+
+  /* dashed tear-off perforation between manifest-style sections */
+  .perforated-top {
+    position: relative;
+  }
+  .perforated-top::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    border-top: 2px dashed var(--color-paper-400);
+  }
+
+  .font-mono-num {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .bg-noise {
+    background-image: radial-gradient(rgba(255, 255, 255, 0.06) 1px, transparent 1px);
+    background-size: 3px 3px;
+  }
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.4; transform: scale(0.85); }
+}
+.animate-pulse-dot {
+  animation: pulse-dot 1.8s ease-in-out infinite;
+}
+
+@keyframes rise-in {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.animate-rise-in {
+  animation: rise-in 0.5s ease-out both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
