@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Check, Copy, ExternalLink, LogOut, Wallet } from "lucide-react";
-import { useWallet } from "../../context/WalletContext";
+import { useWallet } from "../../context/useWallet";
 import { truncateAddress } from "../../lib/format";
 import { EXPLORER_BASE } from "../../lib/stellar";
 

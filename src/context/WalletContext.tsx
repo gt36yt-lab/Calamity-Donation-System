@@ -1,48 +1,16 @@
-import {
-  createContext,
-  useCallback,
-  useContext,
-  useEffect,
-  useState,
-  type ReactNode,
-} from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 import {
   connectFreighter,
   fetchAccountBalances,
   getFreighterConnection,
   getFreighterNetwork,
   isFreighterAvailable,
-  type WalletBalance,
 } from "../lib/stellar";
-
-interface WalletState {
-  address: string | null;
-  network: string | null;
-  balances: WalletBalance[] | null;
-  status: "idle" | "connecting" | "connected" | "unavailable" | "error";
-  errorMessage: string | null;
-}
-
-interface WalletContextValue extends WalletState {
-  connect: () => Promise<void>;
-  disconnect: () => void;
-  refreshBalances: () => Promise<void>;
-}
-
-const WalletContext = createContext<WalletContextValue | null>(null);
-
-const INITIAL_STATE: WalletState = {
-  address: null,
-  network: null,
-  balances: null,
-  status: "idle",
-  errorMessage: null,
-};
+import { WalletContext, INITIAL_STATE, type WalletState } from "./wallet-context";
 
 export function WalletProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState<WalletState>(INITIAL_STATE);
 
-  // Check for an already-authorized Freighter session on mount.
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -96,9 +64,6 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     }));
   }, []);
 
-  // Freighter itself has no site-initiated "revoke" call — this just clears
-  // the app's local session. The extension keeps its own permission until
-  // the person removes it from Freighter's settings.
   const disconnect = useCallback(() => {
     setState(INITIAL_STATE);
   }, []);
@@ -108,10 +73,4 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       {children}
     </WalletContext.Provider>
   );
-}
-
-export function useWallet(): WalletContextValue {
-  const ctx = useContext(WalletContext);
-  if (!ctx) throw new Error("useWallet must be used within WalletProvider");
-  return ctx;
 }
