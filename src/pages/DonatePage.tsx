@@ -11,7 +11,7 @@ import {
   Wallet,
   Zap,
 } from "lucide-react";
-import { useWallet } from "../context/WalletContext";
+import { useWallet } from "../context/useWallet";
 import {
   families,
   assetRates,
