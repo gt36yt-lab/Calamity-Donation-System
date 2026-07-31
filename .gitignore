@@ -39,3 +39,4 @@ target/
 !.kiro/agents/**
 !.kiro/skills/
 !.kiro/skills/**
+.vercel
