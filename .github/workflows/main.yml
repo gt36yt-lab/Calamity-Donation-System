@@ -4,7 +4,7 @@ on:
   push:
     branches:
       - main
-      - integrate-ci
+      - vercel-hosting
   pull_request:
     branches:
       - main
@@ -37,4 +37,49 @@ jobs:
         uses: gitleaks/gitleaks-action@v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-            
+  
+  deploy-preview:
+    name: deploy-vercel-preview
+    needs: build
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    environment: preview
+    env:
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+    steps:
+      - uses: actions/checkout@v6
+      - run: npm install --global vercel@latest
+
+      - name: Pull Vercel environment
+        run: vercel pull --yes --environment=preview 
+
+      - name: Build
+        run: vercel build 
+
+      - name: Deploy Preview
+        run: vercel deploy --prebuilt
+
+  deploy-prod:
+    name: deploy-vercel-prod
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+    steps:
+      - uses: actions/checkout@v6
+      - run: npm install --global vercel@latest
+
+      - name: Pull Vercel environment
+        run: vercel pull --yes --environment=production 
+
+      - name: Build
+        run: vercel build --prod
+
+      - name: Deploy
+        run: vercel deploy --prebuilt --prod
