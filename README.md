@@ -1,88 +1,117 @@
 # TranspaRelief
 
-A transparent, Stellar-backed disaster relief dashboard for Local Government
-Units. It connects macro-level calamity fund accounting to micro-level family
-needs, and lets donors watch a peso turn into a Stellar transaction, then a
-vendor receipt, then a delivered sack of rice.
+A transparent, Stellar-backed disaster relief dashboard for Local Government Units (LGUs). It bridges macro-level calamity fund accounting with micro-level family needs, letting donors trace every peso from wallet to Stellar transaction to vendor receipt.
 
-This is a **frontend-only** build: Vite + React + TypeScript + Tailwind CSS,
-with real `@stellar/stellar-sdk` + `@stellar/freighter-api` wiring for wallet
-connect, balance reads, and signing/submitting a payment. All family, ledger,
-and fund figures are sample data (`src/data/mockData.ts`) — there is no
-backend or database.
+**Stack:** Vite + React 19 + TypeScript + Tailwind CSS 4 · Stellar SDK + Freighter API · Soroban smart contract (Rust)
 
-## Getting started
+---
+
+## Features
+
+### Dashboard
+- Hero summary of active calamities, LGU fund vs. shortfall (hover for breakdown)
+- Needs inventory table with PHP / XLM / USDC / PHPC toggle
+
+### Family Registry (`/families`)
+- Searchable, filterable family cards with itemized needs
+- "Fund this family" deep-link into the Donate page
+
+### Public Ledger (`/ledger`)
+- Live Horizon feed of donor inflows and vendor outflows
+- Each entry links to Stellar Expert
+
+### Donate (`/donate`)
+- Connect Freighter → choose amount → sign and submit a real Testnet XLM payment
+- Friendbot button to fund a fresh wallet before testing
+- USDC/PHPC shown for PHP-conversion context (requires trustline for live transfers)
+
+### Admin Portal (`/admin`)
+- Family registration, budget input, and multi-signer vendor payout forms
+- Local state only — no auth for this demo
+
+### Soroban Smart Contract (`contract/`)
+The `calamity-donation` contract records on-chain donation proofs without moving tokens itself, keeping SAC auth complexity out of the critical path.
+
+| Entry-point | Auth | Description |
+|---|---|---|
+| `__constructor` | admin | Atomic init at deploy (CAP-0058) |
+| `record_donation` | donor | Log a donation with memo tag |
+| `get_total` | — | Cumulative stroops recorded |
+| `get_donor_total` | — | Per-donor cumulative stroops |
+| `get_donor_count` | — | Unique donor count |
+| `get_admin` | — | Admin address |
+
+Storage uses instance TTL (global/count totals) and persistent TTL (per-donor totals), both auto-extended to 60 days.
+
+---
+
+## Getting Started
 
 ```bash
 npm install
 npm run dev
 ```
 
-Open the printed local URL. To try the live Stellar flow on the Donate page
-you'll need the [Freighter](https://www.freighter.app/) browser extension
-set to **Testnet**.
+For the live Stellar flow on `/donate`, install [Freighter](https://www.freighter.app/) and switch it to **Testnet**.
 
 ```bash
-npm run build     # production build (runs tsc -b, then vite build)
+npm run build     # tsc -b + vite build
 npm run preview   # serve the production build locally
 npm run lint      # oxlint
+cargo test        # run Soroban contract unit tests
 ```
 
 ## Configuration
 
-Copy `.env.example` to `.env.local` to point the app at a real LGU wallet
-instead of the bundled demo keypair:
-
 ```bash
-VITE_STELLAR_NETWORK=testnet   # or "public"
-VITE_LGU_WALLET=G...           # the LGU's real Stellar public key
+cp .env.example .env.local
 ```
 
-Without a `.env.local`, the app reads `src/data/mockData.ts`, which contains
-a validly-formatted but **unfunded** testnet keypair — live balance/payment
-reads will gracefully fall back to the cached sample figures.
+| Variable | Default | Description |
+|---|---|---|
+| `VITE_STELLAR_NETWORK` | `testnet` | `testnet` or `public` |
+| `VITE_LGU_WALLET` | demo keypair | LGU's real Stellar public key |
 
-## Pages
+Without `.env.local`, the app falls back to `src/data/mockData.ts` — an unfunded testnet keypair with cached sample figures.
 
-| Route       | Purpose |
-| ----------- | ------- |
-| `/`         | Hero calamity summary, LGU fund vs. shortfall (hover for detail), master needs inventory table with PHP/XLM/USDC/PHPC toggle |
-| `/families` | Family Registry — searchable, filterable cards with itemized needs and a "Fund this family" deep link into Donate |
-| `/ledger`   | Public Stellar ledger feed — donor inflows and vendor outflows, each with a Stellar Expert link |
-| `/admin`    | LGU Management Portal — family registration, budget input, and multi-signer vendor payout forms (local state only, no auth) |
-| `/donate`   | Connect Freighter → choose amount/asset → sign and submit a real testnet payment |
+---
 
-## Stellar integration notes
+## CI/CD Pipeline
 
-- `src/lib/stellar.ts` wraps `Horizon.Server` for balance/payment reads and
-  Freighter for `requestAccess` / `signTransaction`. It builds a native XLM
-  payment with `TransactionBuilder`, signs it via Freighter, and submits it
-  to Horizon.
-- Non-native assets (USDC/PHPC) are shown for PHP-conversion context on the
-  Donate page, but require a trustline to their issuer before a real
-  transfer can be signed — the live "sign & send" button is scoped to XLM
-  for this demo.
-- A Friendbot button appears on Testnet so you can fund a fresh Freighter
-  wallet with test XLM before trying the payment flow end-to-end.
-- The ledger feed and hero wallet tracker are written to read live Horizon
-  data (`fetchAccountBalances`, `fetchRecentPayments`) and fall back to the
-  cached mock data on any error (e.g. an unfunded/nonexistent account) —
-  swap in a real, funded LGU wallet to see it go fully live.
+```
+push / PR
+    │
+    ▼
+┌─────────────────────────────────────┐
+│              build job              │
+│  1. npm install                     │
+│  2. oxlint                          │
+│  3. tsc --noEmit                    │
+│  4. cargo test                      │
+│  5. npm run build                   │
+│  6. Gitleaks secret scan            │
+└──────────┬──────────────────────────┘
+           │
+     ┌─────┴──────┐
+     │            │
+     ▼            ▼
+PR open       push to main
+     │            │
+     ▼            ▼
+ Vercel        Vercel
+ Preview       Production
+ Deploy        Deploy
+```
 
-## Design system
+Triggered on push/PR to `main` (and push to `vercel-hosting`). The deploy jobs are gated on `build` passing. Production deploys only on direct push to `main`; PRs get an isolated preview URL.
 
-The visual language borrows from two things this project bridges: municipal
-paperwork (manifest tables, ink-stamp approvals, dashed tear-lines) and
-storm/orbit charts (the contour rings behind the hero, a nod to both a
-typhoon's eye and the Stellar network itself). Type is Space Grotesk for
-display, Inter for body copy, and JetBrains Mono for all figures, addresses,
-and transaction hashes.
+Secrets required: `VERCEL_TOKEN`, `VERCEL_ORG_ID`, `VERCEL_PROJECT_ID`.
 
-## Known trade-offs (frontend-only demo)
+---
 
-- No authentication on `/admin` — forms update local component state only.
-- Ledger transaction hashes are illustrative sample data, so their Stellar
-  Expert links won't resolve to a real transaction.
-- The production bundle includes the full `@stellar/stellar-sdk`; splitting
-  it behind a lazy-loaded `/donate` route would meaningfully shrink the
-  initial JS payload for a real deployment.
+## Architecture Notes
+
+- `src/lib/stellar.ts` — wraps `Horizon.Server` for balance/payment reads and Freighter for `requestAccess` / `signTransaction`. Builds a native XLM `TransactionBuilder` payment, signs via Freighter, and submits to Horizon. Falls back to mock data on any Horizon error.
+- All family, ledger, and fund figures in the demo are sample data in `src/data/mockData.ts` — no backend or database.
+- Ledger transaction hashes in the demo are illustrative; Stellar Expert links won't resolve to real transactions until a live LGU wallet is wired in.
+- No auth on `/admin` — forms update local component state only.
